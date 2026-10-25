@@ -1,0 +1,12 @@
+.env
+.env.generated
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+runs/
+incidents/
+eval/results.json
+eval/RESULTS.md
+eval/chart.png
+gate0_report.json

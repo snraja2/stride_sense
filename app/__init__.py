@@ -1,0 +1,1 @@
+"""CrashCart application package."""
