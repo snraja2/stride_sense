@@ -5,6 +5,31 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+
+def _load_project_env() -> None:
+    """Load simple KEY=VALUE entries from the repo .env without echoing secrets."""
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        value = line.strip()
+        if not value or value.startswith("#") or "=" not in value:
+            continue
+        key, raw = value.split("=", 1)
+        key = key.strip()
+        raw = raw.strip()
+        if not key.replace("_", "").isalnum() or key in os.environ:
+            continue
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        os.environ[key] = raw
+
+
+_load_project_env()
 
 
 def _int_env(name: str, default: int) -> int:

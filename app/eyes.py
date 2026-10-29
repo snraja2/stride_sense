@@ -73,7 +73,10 @@ async def analyze_dashboard(bundle: Bundle, emit: Callable | None = None, *, ena
         messages = [
             {"role": "system", "content": _PROMPT_PATH.read_text(encoding="utf-8")},
             {"role": "user", "content": [
-                {"type": "text", "text": "Read the dashboard and report only concrete visual observations."},
+                {"type": "text", "text": (
+                    "Read the dashboard and report only concrete visual observations. "
+                    + (f"Synthetic mock fixture: {bundle.root.name}." if llm.settings.mode == "mock" else "")
+                )},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
             ]},
         ]

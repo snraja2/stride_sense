@@ -138,7 +138,16 @@ async def scan(chunk: Chunk, bundle: Bundle, emit: Callable | None = None) -> li
     return findings
 
 
-async def run_swarm(chunks: Iterable[Chunk], bundle: Bundle, emit: Callable | None = None) -> list[dict]:
+async def run_swarm(chunks: Iterable[Chunk], bundle: Bundle, emit: Callable | None = None,
+                    concurrency: int | None = None) -> list[dict]:
     """Scan chunks concurrently; the shared LLM semaphore bounds provider load."""
-    results = await asyncio.gather(*(scan(chunk, bundle, emit) for chunk in chunks))
+    gate = asyncio.Semaphore(max(1, int(concurrency))) if concurrency is not None else None
+
+    async def bounded_scan(chunk: Chunk) -> list[dict]:
+        if gate is None:
+            return await scan(chunk, bundle, emit)
+        async with gate:
+            return await scan(chunk, bundle, emit)
+
+    results = await asyncio.gather(*(bounded_scan(chunk) for chunk in chunks))
     return [finding for group in results for finding in group]

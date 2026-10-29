@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import random
@@ -42,10 +44,33 @@ class StreamDelta:
 
 
 metrics = Metrics()
+_active_metrics: ContextVar[Metrics | None] = ContextVar("crashcart_run_metrics", default=None)
 _semaphore = asyncio.Semaphore(max(1, settings.concurrency))
 _pause_lock = asyncio.Lock()
 _pause_until = 0.0
 _client = None
+
+
+@contextmanager
+def metrics_scope():
+    """Keep per-run counters isolated while retaining aggregate process totals."""
+    local = Metrics()
+    token = _active_metrics.set(local)
+    try:
+        yield local
+    finally:
+        _active_metrics.reset(token)
+
+
+def current_metrics() -> Metrics:
+    return _active_metrics.get() or metrics
+
+
+def _record_metrics(role: str, prompt: int, completion: int, latency: float) -> None:
+    metrics.record(role, prompt, completion, latency)
+    local = _active_metrics.get()
+    if local is not None:
+        local.record(role, prompt, completion, latency)
 
 
 def _client_for_live():
@@ -97,7 +122,7 @@ async def _set_pause(delay: float) -> None:
 
 _FINDING_RE = re.compile(
     r"\b(?:Xid|NCCL\s+WARN|Watchdog|OutOfMemory|nan|Traceback|ECC|Link down|not responding|"
-    r"Killed process|SIGTERM|illegal memory|version)\b", re.IGNORECASE
+    r"Killed process|SIGTERM|Received signal 15|illegal memory|version|reimaged|preempted)\b", re.IGNORECASE
 )
 
 
@@ -118,14 +143,24 @@ def _mock_response(role: str, messages: list[dict]) -> dict:
                 break
         return {"findings": findings}
     if role == "eyes":
+        lower = source.lower()
+        if "synthetic mock fixture: thermal_throttle" in lower:
+            claim = "Synthetic mock fixture: GPU temperature is 94 C and its SM clock collapses; this is a deterministic demo observation, not model vision."
+            severity = 5
+        elif "synthetic mock fixture: power_cap" in lower:
+            claim = "Synthetic mock fixture: GPU temperature is normal, power stays flat, and its SM clock is low; this is a deterministic demo observation, not model vision."
+            severity = 4
+        else:
+            claim = "Synthetic mock observation: dashboard telemetry varies across the GPU grid."
+            severity = 1
         return {
             "observations": [{
                 "id": "O1",
-                "claim": "Synthetic mock observation: dashboard telemetry varies across the GPU grid.",
+                "claim": claim,
                 "entity": None,
                 "metric": "GPU telemetry",
                 "time_ref": None,
-                "severity": 1,
+                "severity": severity,
             }],
             "summary": "Synthetic mock observation; this is not visual analysis.",
         }
@@ -133,6 +168,14 @@ def _mock_response(role: str, messages: list[dict]) -> dict:
         return _mock_reduce_response(messages)
     if role == "skeptic":
         return {"disagree": False, "alternative": "No independent alternative in mock mode.", "check": "Review source evidence."}
+    if role == "baseline":
+        return {
+            "category": "other",
+            "node": None,
+            "gpu": None,
+            "explanation": "The final log lines show a distributed collective timeout, but the tail alone does not expose the earlier root cause.",
+            "next_steps": ["Inspect earlier rank and kernel logs for the first localized anomaly."],
+        }
     return {"text": "mock response"}
 
 
@@ -182,7 +225,7 @@ def _mock_reduce_response(messages: list[dict]) -> dict:
 
     if not category and observations:
         visual_text = "\n".join(str(item.get("claim", "")) for item in observations if isinstance(item, dict)).lower()
-        if "temperature" in visual_text and ("90" in visual_text or "94" in visual_text):
+        if "temperature" in visual_text and any(value in visual_text for value in ("90", "91", "92", "93", "94", "95", "96", "97", "98", "99")):
             category = "thermal_throttle"
         elif "power" in visual_text and "clock" in visual_text:
             category = "power_cap"
@@ -190,6 +233,11 @@ def _mock_reduce_response(messages: list[dict]) -> dict:
     chosen: list[tuple[dict, dict]] = []
     if selected:
         chosen.append(selected[0])
+    if category == "preemption":
+        signal = next((pair for pair in flattened
+                       if re.search(r"Received signal 15", str(pair[1].get("quote", "")), re.IGNORECASE)), None)
+        if signal and signal not in chosen:
+            chosen.append(signal)
     silence = [pair for pair in flattened if pair[0].get("kind") == "silence"]
     if category and silence:
         silence.sort(key=lambda pair: str(pair[0].get("first_ts") or ""))
@@ -211,6 +259,18 @@ def _mock_reduce_response(messages: list[dict]) -> dict:
         }
         evidence.append(item)
         timeline.append({"ts": exemplar.get("timestamp") or cluster.get("first_ts") or "", "event": item["supports"], "evidence_ids": [evidence_id]})
+
+    if category and not evidence and observations:
+        observation = next((item for item in observations if isinstance(item, dict) and item.get("id")), None)
+        if observation:
+            evidence.append({
+                "id": "E1", "file": "dashboard.png", "line_start": None, "line_end": None,
+                "quote": str(observation.get("claim", "")),
+                "observation_id": str(observation["id"]),
+                "supports": "Direct root-cause evidence from the dashboard observation.",
+            })
+            timeline.append({"ts": str(observation.get("time_ref") or ""),
+                             "event": "Dashboard telemetry supports the diagnosis.", "evidence_ids": ["E1"]})
 
     root_node = None
     root_rank = None
@@ -280,7 +340,7 @@ async def call(role: str, messages: list[dict], **kw: Any) -> tuple[Any, float]:
             prompt_tokens = _estimate_messages(messages)
             completion_tokens = len(json.dumps(response)) // 4
             elapsed = time.perf_counter() - start
-            metrics.record(role, prompt_tokens, completion_tokens, elapsed)
+            _record_metrics(role, prompt_tokens, completion_tokens, elapsed)
             return response, elapsed
         if not settings.api_key:
             raise RuntimeError("Set LLM_API_KEY or NEBIUS_API_KEY when LLM_MODE=live")
@@ -295,7 +355,7 @@ async def call(role: str, messages: list[dict], **kw: Any) -> tuple[Any, float]:
                 response = await client.chat.completions.create(**request)
                 prompt_tokens, completion_tokens = _usage(response, _estimate_messages(messages))
                 elapsed = time.perf_counter() - start
-                metrics.record(role, prompt_tokens, completion_tokens, elapsed)
+                _record_metrics(role, prompt_tokens, completion_tokens, elapsed)
                 return response, elapsed
             except Exception as exc:
                 status = getattr(exc, "status_code", None)
@@ -342,4 +402,4 @@ async def call_stream(role: str, messages: list[dict], **kw: Any) -> AsyncIterat
                     yield StreamDelta(text=content)
             if usage is not None:
                 yield StreamDelta(usage=usage)
-        metrics.record(role, prompt_tokens, completion_chars // 4, time.perf_counter() - start)
+        _record_metrics(role, prompt_tokens, completion_chars // 4, time.perf_counter() - start)
