@@ -25,7 +25,9 @@ def _float_env(name: str, default: float) -> float:
 class Settings:
     api_key: str = os.getenv("LLM_API_KEY") or os.getenv("NEBIUS_API_KEY", "")
     base_url: str = os.getenv("LLM_BASE_URL", "https://api.tokenfactory.nebius.com/v1/")
-    mode: str = os.getenv("LLM_MODE", "live").lower()
+    # Make a fresh checkout safe to run without credentials. Live provider calls
+    # are an explicit opt-in after a developer has configured their key.
+    mode: str = os.getenv("LLM_MODE", "mock").lower()
     concurrency: int = _int_env("CONCURRENCY", 24)
     daily_run_cap: int = _int_env("DAILY_RUN_CAP", 60)
     ip_runs_per_hour: int = _int_env("IP_RUNS_PER_HOUR", 3)
