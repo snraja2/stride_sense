@@ -111,6 +111,16 @@ async def main() -> None:
         ordered = sorted(latencies)
         percentile = lambda p: ordered[min(len(ordered) - 1, int((len(ordered) - 1) * p))] if ordered else None
         report["concurrency"][str(concurrency)] = {"success_rate": statuses.count(None) / concurrency, "rate_limits": statuses.count(429), "p50_s": percentile(.50), "p95_s": percentile(.95)}
+    stable_concurrency = [
+        int(value) for value, result in report["concurrency"].items()
+        if result["success_rate"] >= .95 and result["rate_limits"] == 0
+    ]
+    report["recommended_concurrency"] = max(stable_concurrency) if stable_concurrency else 8
+    report["concurrency_recommendation_note"] = (
+        "All tested levels were stable; selected the highest stable level."
+        if stable_concurrency
+        else "No tested level met the stability threshold; start at 8 and ask the provider about the limit."
+    )
     fig, ax = plt.subplots(figsize=(2, 1))
     ax.text(.5, .5, "RANK 13", ha="center", va="center", fontsize=20)
     ax.axis("off")
@@ -126,7 +136,18 @@ async def main() -> None:
     png.unlink(missing_ok=True)
     output = ROOT / "gate0_report.json"
     output.write_text(json.dumps(report, indent=2) + "\n")
-    print("Gate 0 summary:", json.dumps({"base_url": base_url, "models": models, "role_calls": report["role_calls"], "json_mode": report["json_mode"], "vision": report["vision"]}, indent=2))
+    summary = {
+        "base_url": base_url,
+        "models": models,
+        "role_calls": report["role_calls"],
+        "json_mode": report["json_mode"],
+        "reasoning": report["reasoning"],
+        "concurrency": report["concurrency"],
+        "recommended_concurrency": report["recommended_concurrency"],
+        "concurrency_recommendation_note": report["concurrency_recommendation_note"],
+        "vision": report["vision"],
+    }
+    print("Gate 0 summary:", json.dumps(summary, indent=2))
     print(f"Full report: {output}")
 
 
