@@ -13,6 +13,11 @@ def test_mock_swarm_finds_grep_style_lines():
     assert "Xid" in result["findings"][0]["quote"]
 
 
+def test_mock_swarm_ignores_xid_inside_incident_identifier():
+    result = _mock_response("swarm", [{"content": "L00001|job_id: synthetic-xid79_demo"}])
+    assert result["findings"] == []
+
+
 def test_metrics_accumulate_by_role():
     metrics.record("unit", 2, 3, 0.5)
     assert metrics.calls["unit"] >= 1

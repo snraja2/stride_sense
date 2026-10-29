@@ -63,10 +63,10 @@ def _rank_log(path: Path, rank: int, fault: str, faulty_rank: int, faulty_node: 
         if fault == "nan_divergence" and rank != faulty_rank and i == 301:
             lines.append(f"{timestamp(seconds)} ERROR FloatingPointError: loss is nan after gnorm inf")
             break
-        if fault == "illegal_access" and rank == faulty_rank and i == 290:
+        if fault == "illegal_access" and rank == faulty_rank and i == 300:
             lines.append(f"{timestamp(seconds)} ERROR CUDA error: an illegal memory access was encountered")
             break
-        if fault == "dataloader_oom_kill" and rank == faulty_rank and i == 290:
+        if fault == "dataloader_oom_kill" and rank == faulty_rank and i == 300:
             lines.append(f"{timestamp(seconds)} ERROR DataLoader worker (pid 9931) is killed by signal: Killed")
             break
         if fault == "preemption" and node == faulty_node and i == 300:
