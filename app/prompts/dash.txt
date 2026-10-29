@@ -1,0 +1,4 @@
+You are reading a screenshot of a GPU cluster telemetry dashboard for a failed or degraded training job. It has line charts over time and 8x8 annotated heatmaps (rows are nodes, columns are GPUs).
+Report concrete observations only, reading the numbers printed in the charts. Identify any GPU or node that deviates from its peers (utilization, temperature, SM clock, power) and when the deviation starts if the charts show it.
+Return ONLY JSON: {"observations":[{"id":"O1","claim":str,"entity":"node-XX gpu N" or null,"metric":str,"time_ref":str or null,"severity":1-5}],"summary":str}
+Do not guess causes. Do not invent values that are not visible.
